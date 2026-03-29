@@ -88,7 +88,7 @@ class AlgoStrategy(gamelib.AlgoCore):
         self.BASE_TURRETS         = [[11, 11], [16, 11], [12, 12], [15, 12]]
         self.BASE_TURRETS_UPGRADE = [[12, 10], [15, 10]]
         # Supports: (13,8) removed → remaining cluster
-        self.BASE_SUPPORTS        = [[12, 11], [13, 11], [14, 11], [15, 11], [14, 8]]
+        self.BASE_SUPPORTS        = [[12, 11], [13, 11], [14, 11], [15, 11]]
         self.BASE_SUPPORTS_UPG    = [[12, 11], [13, 11],[14,11]]
 
         # ---- Breach / zone tracking ----
