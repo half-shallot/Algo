@@ -84,13 +84,12 @@ class AlgoStrategy(gamelib.AlgoCore):
         self.MAP_HEIGHT = 28
 
         # ---- Base layout (NO (13,8) support) ----
-        # Turrets: (12,10)* and (15,10)* deployed FIRST on turn 0
-        self.TURN0_TURRETS        = [[12, 10], [15, 10]]
-        self.BASE_TURRETS         = [[11, 9], [16, 9], [12, 10], [15, 10]]
+        self.TURN0_TURRETS        = [[12, 12], [15, 12]]
+        self.BASE_TURRETS         = [[11, 11], [16, 11], [12, 12], [15, 12]]
         self.BASE_TURRETS_UPGRADE = [[12, 10], [15, 10]]
         # Supports: (13,8) removed → remaining cluster
-        self.BASE_SUPPORTS        = [[12, 9], [13, 9], [14, 9], [15, 9], [14, 8]]
-        self.BASE_SUPPORTS_UPG    = [[12, 9], [15, 9]]
+        self.BASE_SUPPORTS        = [[12, 11], [13, 11], [14, 11], [15, 11], [14, 8]]
+        self.BASE_SUPPORTS_UPG    = [[12, 11], [13, 11],[14,11]]
 
         # ---- Breach / zone tracking ----
         self.breach_counts = {}   # (x,y) -> int
@@ -449,10 +448,6 @@ class AlgoStrategy(gamelib.AlgoCore):
         if t == 0:
             gs.attempt_spawn(TURRET,   self.TURN0_TURRETS)
 
-        # Recover base every turn
-        gs.attempt_spawn(TURRET,   self.BASE_TURRETS)
-        gs.attempt_spawn(SUPPORT,  self.BASE_SUPPORTS)
-        gs.attempt_upgrade(        self.BASE_SUPPORTS_UPG)
 
         # Structural defense updates with live scoring
         if self._turn_unit_maps:
@@ -462,6 +457,11 @@ class AlgoStrategy(gamelib.AlgoCore):
             self._reactive_zone_defense(gs)
 
         self._deploy_interceptors(gs, t, mp)
+
+        # Recover base every turn
+        gs.attempt_spawn(TURRET,   self.BASE_TURRETS)
+        gs.attempt_spawn(SUPPORT,  self.BASE_SUPPORTS)
+        gs.attempt_upgrade(        self.BASE_SUPPORTS_UPG)
 
         if self.enemy_intel['tactic_changes'] >= 2:
             self._deploy_adaptive_support(gs)
