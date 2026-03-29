@@ -80,6 +80,8 @@ class AlgoStrategy(gamelib.AlgoCore):
         self.MID_X = set(range(9, 19))   # 9..18
         self.MID_Y = set(range(8, 14))   # 8..13
         self.DN_Y  = set(range(0, 8))    # 0..7  (down-tri, same X as mid)
+        self.MAP_WIDTH = 28
+        self.MAP_HEIGHT = 28
 
         # ---- Base layout (NO (13,8) support) ----
         # Turrets: (12,10)* and (15,10)* deployed FIRST on turn 0
@@ -95,7 +97,10 @@ class AlgoStrategy(gamelib.AlgoCore):
         self.breach_turns  = {}   # (x,y) -> [turn#, ...]
         self.zone_breach   = {self.Z_LEFT: 0, self.Z_RIGHT: 0,
                                self.Z_MID: 0,  self.Z_DOWN: 0}
+        self.region_damage = {self.Z_LEFT: 0, self.Z_RIGHT: 0,
+                               self.Z_MID: 0,  self.Z_DOWN: 0}
         self.current_turn  = 0
+        self.recent_attack_window = 5
 
         # ---- Attack log ----
         # {side, eff, turn, spawn, path_density, dmg, units, unit_type}
@@ -158,19 +163,71 @@ class AlgoStrategy(gamelib.AlgoCore):
             self.Z_DOWN:  [13, 10],
         }
 
+        # ---- Region layout + coverage targets ----
+        self._init_region_layout()
+        self._support_coverage_target = 0.75
+        self._strong_defense_support_target = 0.85
+
+    # =========================================================================
+    # REGION / ZONE SHAPES
+    # =========================================================================
+
+    def _init_region_layout(self):
+        """Build explicit region tiles and edges for scoring and placement."""
+        self.region_tiles = self._build_region_tiles()
+        self.region_edges = self._build_region_edges(self.region_tiles)
+
+    def _build_region_tiles(self):
+        """Create explicit tiles for left/right triangles and mid/down regions."""
+        tiles = {
+            self.Z_LEFT: set(),
+            self.Z_RIGHT: set(),
+            self.Z_MID: set(),
+            self.Z_DOWN: set(),
+        }
+        for x in range(self.MAP_WIDTH):
+            for y in range(14):
+                tiles[self._explicit_zone_for_tile(x, y)].add((x, y))
+        return tiles
+
+    def _explicit_zone_for_tile(self, x, y):
+        if x in self.MID_X and y in self.MID_Y:
+            return self.Z_MID
+        if x in self.MID_X and y in self.DN_Y:
+            return self.Z_DOWN
+
+        left_diag = x <= 8 and y >= x
+        right_diag = x >= 19 and y >= (27 - x)
+
+        if left_diag:
+            return self.Z_LEFT
+        if right_diag:
+            return self.Z_RIGHT
+
+        return self.Z_LEFT if x < 9 else self.Z_RIGHT
+
+    def _build_region_edges(self, region_tiles):
+        """Mark boundary tiles in each region to identify exposed edges."""
+        edges = {zone: set() for zone in region_tiles}
+        for zone, tiles in region_tiles.items():
+            for (x, y) in tiles:
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nx, ny = x + dx, y + dy
+                    if (nx, ny) not in tiles:
+                        edges[zone].add((x, y))
+                        break
+        return edges
+
     # =========================================================================
     # ZONE CLASSIFIER
     # =========================================================================
 
     def zone_of(self, x, y):
         """Classify a tile on OUR side into one of the 4 defense zones."""
-        if x in self.MID_X and y in self.MID_Y:
-            return self.Z_MID
-        if x in self.MID_X and y in self.DN_Y:
-            return self.Z_DOWN
-        if x < 9:
-            return self.Z_LEFT
-        return self.Z_RIGHT
+        for zone, tiles in self.region_tiles.items():
+            if (x, y) in tiles:
+                return zone
+        return self.Z_LEFT if x < 9 else self.Z_RIGHT
 
     # =========================================================================
     # MAIN TURN
@@ -184,6 +241,9 @@ class AlgoStrategy(gamelib.AlgoCore):
         self.current_turn = t
         gs.suppress_warnings(True)
         gamelib.debug_write('=== Turn {} | MP:{:.1f} HP:{} ==='.format(t, mp, hp))
+
+        # Live map split (my vs enemy) for scoring/placement
+        self._turn_unit_maps = self._collect_unit_maps(gs)
 
         # 1. Log previous attack result
         self._process_attack_result(gs, t)
@@ -202,6 +262,24 @@ class AlgoStrategy(gamelib.AlgoCore):
         self._run_offense(gs, t, hp, mp)
 
         gs.submit_turn()
+
+    # =========================================================================
+    # MAP INTEL — LIVE UNIT SPLIT
+    # =========================================================================
+
+    def _collect_unit_maps(self, gs):
+        """Split gs.game_map[x, y] → my units vs enemy units in real time."""
+        my_units = {}
+        enemy_units = {}
+        for x in range(self.MAP_WIDTH):
+            for y in range(self.MAP_HEIGHT):
+                units = gs.game_map[x, y]
+                if not units:
+                    continue
+                for unit in units:
+                    target = my_units if unit.player_index == 0 else enemy_units
+                    target.setdefault((x, y), []).append(unit)
+        return {'my': my_units, 'enemy': enemy_units}
 
     # =========================================================================
     # ATTACK RESULT PROCESSING
@@ -362,21 +440,23 @@ class AlgoStrategy(gamelib.AlgoCore):
 
     def _build_defense(self, gs, t, mp):
         """
-        Turn 0 : Deploy (12,10) and (15,10) turrets FIRST, upgraded immediately.
-        Every  : Recover base layout (turrets → upgrade → supports → upgrade).
-        Turn 2+: Zone-reactive turrets based on breach log.
+        Turn 0 : Deploy (12,10) and (15,10) turrets FIRST.
+        Every  : Recover base layout (turrets → supports → upgrade supports).
+        Turn 2+: Zone-reactive turrets based on breach log (no turret upgrades).
         Always : Interceptors to patrol the hottest breach zone.
         Always : If enemy changing tactics → upgraded support in mid-rect.
         """
         if t == 0:
             gs.attempt_spawn(TURRET,   self.TURN0_TURRETS)
-            gs.attempt_upgrade(        self.TURN0_TURRETS)
 
         # Recover base every turn
         gs.attempt_spawn(TURRET,   self.BASE_TURRETS)
-        gs.attempt_upgrade(        self.BASE_TURRETS_UPGRADE)
         gs.attempt_spawn(SUPPORT,  self.BASE_SUPPORTS)
         gs.attempt_upgrade(        self.BASE_SUPPORTS_UPG)
+
+        # Structural defense updates with live scoring
+        if self._turn_unit_maps:
+            self._apply_structural_defense(gs, self._turn_unit_maps)
 
         if t >= 2:
             self._reactive_zone_defense(gs)
@@ -385,6 +465,248 @@ class AlgoStrategy(gamelib.AlgoCore):
 
         if self.enemy_intel['tactic_changes'] >= 2:
             self._deploy_adaptive_support(gs)
+
+    # ---- Structural defense scoring and placement ----
+
+    def _apply_structural_defense(self, gs, unit_maps):
+        """Rank regions by defense score and reinforce weakest spots."""
+        region_scores = self._rank_regions_by_defense(gs, unit_maps)
+        if not region_scores:
+            return
+
+        weakest = region_scores[0]
+        strongest = region_scores[-1]
+
+        self._deploy_support_to_region(gs, unit_maps, weakest)
+        self._deploy_turrets_to_region(gs, unit_maps, weakest)
+        self._upgrade_supports_if_strong(gs, unit_maps, strongest)
+
+    def _rank_regions_by_defense(self, gs, unit_maps):
+        """Return ordered list of region score dicts (weakest → strongest)."""
+        scores = [
+            self._defensive_score_left(gs, unit_maps),
+            self._defensive_score_right(gs, unit_maps),
+            self._defensive_score_mid(gs, unit_maps),
+            self._defensive_score_down(gs, unit_maps),
+        ]
+        return sorted(scores, key=lambda entry: entry['score'])
+
+    def _defensive_score_left(self, gs, unit_maps):
+        base = self._defensive_score_base(self.Z_LEFT, gs, unit_maps)
+        base['score'] *= 0.7
+        base['region'] = self.Z_LEFT
+        return base
+
+    def _defensive_score_right(self, gs, unit_maps):
+        base = self._defensive_score_base(self.Z_RIGHT, gs, unit_maps)
+        base['score'] *= 0.7
+        base['region'] = self.Z_RIGHT
+        return base
+
+    def _defensive_score_mid(self, gs, unit_maps):
+        base = self._defensive_score_base(self.Z_MID, gs, unit_maps)
+        base['region'] = self.Z_MID
+        return base
+
+    def _defensive_score_down(self, gs, unit_maps):
+        base = self._defensive_score_base(self.Z_DOWN, gs, unit_maps)
+        mid_edge_support = self._mid_edge_support_score(unit_maps)
+        base['score'] += 2.5 * mid_edge_support
+        base['region'] = self.Z_DOWN
+        return base
+
+    def _defensive_score_base(self, region, gs, unit_maps):
+        """Compute defense score with turrets, supports, walls, breaches, and exposure."""
+        counts = self._count_structures(region, unit_maps)
+        edge_turrets = self._edge_neighbor_turrets(region, unit_maps)
+        support_positions = self._support_positions(unit_maps)
+        support_coverage = self._support_coverage_ratio(region, support_positions)
+        recent_breaches = self._recent_breach_count(region)
+        health_damage = self.region_damage.get(region, 0)
+        edge_exposure = self._edge_exposure(region, gs, unit_maps)
+
+        turret_value = math.sqrt(max(1, counts['turret'])) * 3.0
+        support_value = (counts['support'] + 0.5 * edge_turrets) * 2.0
+        wall_value = counts['wall'] * 0.4
+        coverage_value = (support_coverage ** 2) * 6.0
+
+        penalty = (recent_breaches * 2.0) + (health_damage * 2.5) + (edge_exposure * 1.2)
+        score = turret_value + support_value + wall_value + coverage_value - penalty
+
+        return {
+            'region': region,
+            'score': score,
+            'counts': counts,
+            'edge_turrets': edge_turrets,
+            'support_coverage': support_coverage,
+            'recent_breaches': recent_breaches,
+            'health_damage': health_damage,
+            'edge_exposure': edge_exposure,
+        }
+
+    def _count_structures(self, region, unit_maps):
+        counts = {'turret': 0, 'support': 0, 'wall': 0}
+        for coord, units in unit_maps['my'].items():
+            if coord not in self.region_tiles[region]:
+                continue
+            for unit in units:
+                if unit.unit_type == TURRET:
+                    counts['turret'] += 1
+                elif unit.unit_type == SUPPORT:
+                    counts['support'] += 1
+                elif unit.unit_type == WALL:
+                    counts['wall'] += 1
+        return counts
+
+    def _edge_neighbor_turrets(self, region, unit_maps):
+        """Count turrets sitting on neighbor edges that help this region."""
+        turrets = set()
+        for (x, y) in self.region_edges[region]:
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                loc = (x + dx, y + dy)
+                for unit in unit_maps['my'].get(loc, []):
+                    if unit.unit_type == TURRET:
+                        turrets.add(loc)
+        return len(turrets)
+
+    def _support_positions(self, unit_maps):
+        supports = []
+        for coord, units in unit_maps['my'].items():
+            for unit in units:
+                if unit.unit_type == SUPPORT:
+                    supports.append(coord)
+        return supports
+
+    def _support_coverage_ratio(self, region, support_positions):
+        """Approximate coverage of region tiles by supports (radius 3)."""
+        tiles = self.region_tiles[region]
+        if not tiles:
+            return 0.0
+        covered = 0
+        for tile in tiles:
+            if any(self._manhattan(tile, sp) <= 3 for sp in support_positions):
+                covered += 1
+        return covered / max(1, len(tiles))
+
+    def _recent_breach_count(self, region):
+        cutoff = self.current_turn - self.recent_attack_window
+        count = 0
+        for coord, turns in self.breach_turns.items():
+            if coord in self.region_tiles[region]:
+                count += sum(1 for turn in turns if turn >= cutoff)
+        return count
+
+    def _edge_exposure(self, region, gs, unit_maps):
+        """Count edge tiles without turret coverage to estimate exposure."""
+        exposed = 0
+        for tile in self.region_edges[region]:
+            if self._turret_coverage(tile, gs) == 0:
+                exposed += 1
+        return exposed
+
+    def _turret_coverage(self, tile, gs):
+        return sum(1 for unit in gs.get_attackers(tile, 0) if unit.unit_type == TURRET)
+
+    def _mid_edge_support_score(self, unit_maps):
+        boundary_tiles = [tile for tile in self.region_tiles[self.Z_MID] if tile[1] == 8]
+        if not boundary_tiles:
+            return 0.0
+        supports = self._support_positions(unit_maps)
+        covered = sum(1 for tile in boundary_tiles if any(self._manhattan(tile, sp) <= 3 for sp in supports))
+        return covered / len(boundary_tiles)
+
+    def _critical_points(self, region, gs, unit_maps):
+        """Find critical tiles based on breaches and weak coverage."""
+        cutoff = self.current_turn - self.recent_attack_window
+        breached = []
+        for coord, turns in self.breach_turns.items():
+            if coord in self.region_tiles[region] and any(turn >= cutoff for turn in turns):
+                breached.append((len(turns), coord))
+        breached.sort(reverse=True)
+        points = [coord for _, coord in breached[:3]]
+
+        if not points:
+            edge_tiles = list(self.region_edges[region])
+            edge_tiles.sort(key=lambda t: self._turret_coverage(t, gs))
+            points = edge_tiles[:3]
+
+        if not points:
+            points = list(self.region_tiles[region])[:3]
+
+        return points
+
+    def _deploy_support_to_region(self, gs, unit_maps, region_score):
+        """Deploy support to weakest region if coverage is low."""
+        region = region_score['region']
+        support_positions = self._support_positions(unit_maps)
+        coverage = self._support_coverage_ratio(region, support_positions)
+        if coverage >= self._support_coverage_target:
+            return
+
+        candidates = self._support_candidate_locations(gs, unit_maps, region)
+        for loc in candidates:
+            if gs.attempt_spawn(SUPPORT, loc):
+                if region_score['score'] >= 0:
+                    gs.attempt_upgrade([loc])
+                break
+
+    def _upgrade_supports_if_strong(self, gs, unit_maps, region_score):
+        """Upgrade supports in strong regions that still lack coverage."""
+        region = region_score['region']
+        support_positions = self._support_positions(unit_maps)
+        coverage = self._support_coverage_ratio(region, support_positions)
+        if coverage >= self._strong_defense_support_target:
+            return
+
+        candidates = self._support_candidate_locations(gs, unit_maps, region)
+        for loc in candidates:
+            if gs.attempt_spawn(SUPPORT, loc):
+                gs.attempt_upgrade([loc])
+                break
+
+    def _support_candidate_locations(self, gs, unit_maps, region):
+        """Suggest support tiles in/near region (adjacent allowed if it improves coverage)."""
+        candidates = []
+        for point in self._critical_points(region, gs, unit_maps):
+            for dx, dy in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, 2), (2, 0), (-2, 0)):
+                loc = (point[0] + dx, point[1] + dy)
+                if not gs.game_map.in_arena_bounds(loc):
+                    continue
+                if gs.contains_stationary_unit(loc):
+                    continue
+                candidates.append(loc)
+
+        # Allow adjacent regions by widening to nearby tiles if needed
+        if not candidates:
+            for (x, y) in self.region_edges[region]:
+                for dx, dy in ((0, 1), (1, 0), (-1, 0)):
+                    loc = (x + dx, y + dy)
+                    if not gs.game_map.in_arena_bounds(loc):
+                        continue
+                    if gs.contains_stationary_unit(loc):
+                        continue
+                    candidates.append(loc)
+
+        # Preserve order, remove duplicates
+        seen = set()
+        unique = []
+        for loc in candidates:
+            if loc in seen:
+                continue
+            seen.add(loc)
+            unique.append(loc)
+        return unique
+
+    def _deploy_turrets_to_region(self, gs, unit_maps, region_score):
+        """Deploy additional turrets at critical points (no turret upgrades)."""
+        region = region_score['region']
+        critical = self._critical_points(region, gs, unit_maps)
+        for loc in critical:
+            if gs.attempt_spawn(TURRET, loc):
+                break
+
+    def _manhattan(self, a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
     # ---- Reactive zone-based turret placement ----
 
@@ -396,7 +718,7 @@ class AlgoStrategy(gamelib.AlgoCore):
           RIGHT_TRI: mirror corner [23,11],[22,11]
           MID_RECT : reinforce mid flanks  [11,10],[16,10],[13,11],[14,11]
           DOWN_TRI : junction breaches → 2 turrets at FAR corner (opposite x)
-        All reactive turrets are upgraded if SP permits.
+        All reactive turrets are deployed without upgrades.
         """
         sorted_bc = sorted(self.breach_counts.items(), key=lambda kv: -kv[1])
         for (x, y), count in sorted_bc:
@@ -421,9 +743,8 @@ class AlgoStrategy(gamelib.AlgoCore):
 
     def _place_turrets(self, gs, targets):
         for t in targets:
-            gs.attempt_spawn(TURRET, t)
-            gs.attempt_upgrade([t])
-            self._reactive_placed.add(tuple(t))
+            if gs.attempt_spawn(TURRET, t):
+                self._reactive_placed.add(tuple(t))
 
     # ---- Interceptor deployment ----
 
@@ -539,8 +860,7 @@ class AlgoStrategy(gamelib.AlgoCore):
     # ---- Demolisher-first corner clear ----
 
     def _demolisher_clear_then_attack(self, gs, side, scout_spawn, budget, lsp, rsp):
-        """
-        Deploy demolisher(s) from the spawn point nearest to the blocked corner
+        """Deploy demolisher(s) from the spawn point nearest to the blocked corner
         so the demolisher REACHES and CLEARS the fortified zone BEFORE scouts
         arrive — reducing HP enough for scouts to break through.
 
@@ -589,8 +909,7 @@ class AlgoStrategy(gamelib.AlgoCore):
     # =========================================================================
 
     def _choose_side(self, gs, lsp, rsp):
-        """
-        Priority order:
+        """Priority order:
           1. If probing side hard-blocked and other is not → switch.
           2. Path-intel density gap ≥ 2 → attack sparser side.
           3. Continue current probing side.
@@ -688,6 +1007,7 @@ class AlgoStrategy(gamelib.AlgoCore):
 
                 zone = self.zone_of(loc[0], loc[1])
                 self.zone_breach[zone] = self.zone_breach.get(zone, 0) + 1
+                self.region_damage[zone] = self.region_damage.get(zone, 0) + 1
                 self.enemy_intel['last_breach_zone'] = zone
 
                 gamelib.debug_write('Breach@{} zone={} count={}'.format(
