@@ -167,6 +167,15 @@ class AlgoStrategy(gamelib.AlgoCore):
         self._support_coverage_target = 0.75
         self._strong_defense_support_target = 0.85
 
+        # ---- Down-triangle upgraded support pocket ----
+        self._down_support_pocket = [[11, 6], [12, 6], [13, 6], [14, 6], [15, 6],
+                                     [12, 5], [13, 5], [14, 5]]
+        self._down_support_min_breaches = 2
+
+        # ---- Interceptor throttling ----
+        self._last_interceptor_turn = -99
+        self._interceptor_cooldown = 3
+
     # =========================================================================
     # REGION / ZONE SHAPES
     # =========================================================================
@@ -438,8 +447,7 @@ class AlgoStrategy(gamelib.AlgoCore):
     # =========================================================================
 
     def _build_defense(self, gs, t, mp):
-        """
-        Turn 0 : Deploy (12,10) and (15,10) turrets FIRST.
+        """Turn 0 : Deploy (12,10) and (15,10) turrets FIRST.
         Every  : Recover base layout (turrets → supports → upgrade supports).
         Turn 2+: Zone-reactive turrets based on breach log (no turret upgrades).
         Always : Interceptors to patrol the hottest breach zone.
@@ -462,6 +470,9 @@ class AlgoStrategy(gamelib.AlgoCore):
         gs.attempt_spawn(TURRET,   self.BASE_TURRETS)
         gs.attempt_spawn(SUPPORT,  self.BASE_SUPPORTS)
         gs.attempt_upgrade(        self.BASE_SUPPORTS_UPG)
+
+        # Prioritize upgraded support pocket in down triangle when under pressure
+        self._deploy_down_triangle_support(gs)
 
         if self.enemy_intel['tactic_changes'] >= 2:
             self._deploy_adaptive_support(gs)
@@ -525,12 +536,13 @@ class AlgoStrategy(gamelib.AlgoCore):
         health_damage = self.region_damage.get(region, 0)
         edge_exposure = self._edge_exposure(region, gs, unit_maps)
 
-        turret_value = math.sqrt(max(1, counts['turret'])) * 3.0
-        support_value = (counts['support'] + 0.5 * edge_turrets) * 2.0
+        # Heavier turret weighting, lighter support weighting to favor damage-first defenses.
+        turret_value = math.sqrt(max(1, counts['turret'])) * 5.0
+        support_value = (counts['support'] + 0.5 * edge_turrets) * 1.1
         wall_value = counts['wall'] * 0.4
-        coverage_value = (support_coverage ** 2) * 6.0
+        coverage_value = (support_coverage ** 2) * 3.5
 
-        penalty = (recent_breaches * 2.0) + (health_damage * 2.5) + (edge_exposure * 1.2)
+        penalty = (recent_breaches * 2.0) + (health_damage * 2.5) + (edge_exposure * 1.4)
         score = turret_value + support_value + wall_value + coverage_value - penalty
 
         return {
@@ -701,8 +713,11 @@ class AlgoStrategy(gamelib.AlgoCore):
         """Deploy additional turrets at critical points (no turret upgrades)."""
         region = region_score['region']
         critical = self._critical_points(region, gs, unit_maps)
+        placed = 0
         for loc in critical:
             if gs.attempt_spawn(TURRET, loc):
+                placed += 1
+            if placed >= 2:
                 break
 
     def _manhattan(self, a, b):
@@ -749,8 +764,7 @@ class AlgoStrategy(gamelib.AlgoCore):
     # ---- Interceptor deployment ----
 
     def _deploy_interceptors(self, gs, t, mp):
-        """
-        Deploy 1-2 interceptors at the patrol point of the zone that has
+        """Deploy 1-2 interceptors at the patrol point of the zone that has
         received the most enemy breaches. Skip if no breaches or not enough MP.
         Interceptors are DEFENSIVE mobile units — they chase enemy scouts.
         """
@@ -758,28 +772,32 @@ class AlgoStrategy(gamelib.AlgoCore):
             return
         if not self.zone_breach or max(self.zone_breach.values()) == 0:
             return
+        if (t - self._last_interceptor_turn) < self._interceptor_cooldown:
+            return
 
         worst_zone = max(self.zone_breach, key=self.zone_breach.get)
+        if self.zone_breach[worst_zone] < 2:
+            return
         patrol_pt  = self._icept_patrol.get(worst_zone)
         if not patrol_pt:
             return
 
         # Reserve enough MP for offense; only spend 3-6 on interceptors
-        n = 2 if self.zone_breach[worst_zone] >= 3 else 1
+        n = 1 if self.zone_breach[worst_zone] < 4 else 2
         cost = n * 3
-        if mp - cost < self._min_attack_mp:
+        if mp - cost < self._min_attack_mp + 2:
             return
 
         spawned = gs.attempt_spawn(INTERCEPTOR, patrol_pt, n)
         if spawned:
+            self._last_interceptor_turn = t
             gamelib.debug_write('Interceptor x{} at {} zone={}'.format(
                 n, patrol_pt, worst_zone))
 
     # ---- Adaptive support when enemy is shifting tactics ----
 
     def _deploy_adaptive_support(self, gs):
-        """
-        When the enemy is frequently changing their attack approach, we can't
+        """When the enemy is frequently changing their attack approach, we can't
         pinpoint where they'll breach next. Deploy upgraded supports in the
         mid-rect to provide area-wide shielding for our mobile units.
         """
@@ -789,13 +807,24 @@ class AlgoStrategy(gamelib.AlgoCore):
         gamelib.debug_write('AdaptiveSupport deployed (tactic_changes={})'.format(
             self.enemy_intel['tactic_changes']))
 
+    def _deploy_down_triangle_support(self, gs):
+        """Deploy upgraded support pocket in down-triangle when it is under pressure."""
+        down_breaches = self._recent_breach_count(self.Z_DOWN)
+        if down_breaches < self._down_support_min_breaches:
+            return
+
+        for loc in self._down_support_pocket:
+            if not gs.game_map.in_arena_bounds(loc):
+                continue
+            if gs.attempt_spawn(SUPPORT, loc):
+                gs.attempt_upgrade([loc])
+
     # =========================================================================
     # OFFENSE
     # =========================================================================
 
     def _run_offense(self, gs, t, hp, mp):
-        """
-        Turn 0            : diagonal rush with scouts (≤ budget).
+        """Turn 0            : diagonal rush with scouts (≤ budget).
         Early (t 1-4)     : small probes, scouts only — no demolisher.
         Mid   (t 5-14)    : probing with intel-guided side selection; no demolisher.
                             If avg_eff < 80% → switch strategy using path intel.
